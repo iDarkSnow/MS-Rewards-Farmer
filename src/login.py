@@ -1,130 +1,149 @@
+import argparse
 import contextlib
 import logging
-import time
-import urllib.parse
+from argparse import Namespace
 
+from pyotp import TOTP
+from selenium.common import TimeoutException
 from selenium.webdriver.common.by import By
+from undetected_chromedriver import Chrome
 
 from src.browser import Browser
 
 
 class Login:
-    def __init__(self, browser: Browser):
+    browser: Browser
+    args: Namespace
+    webdriver: Chrome
+
+    def __init__(self, browser: Browser, args: argparse.Namespace):
         self.browser = browser
         self.webdriver = browser.webdriver
         self.utils = browser.utils
+        self.args = args
 
-    def login(self):
-        logging.info("[LOGIN] " + "Logging-in...")
-        self.webdriver.get(
-            "https://rewards.bing.com/Signin/"
-        )  # changed site to allow bypassing when M$ blocks access to login.live.com randomly
-        alreadyLoggedIn = False
-        while True:
-            try:
-                self.utils.waitUntilVisible(
-                    By.CSS_SELECTOR, 'html[data-role-name="RewardsPortal"]', 0.1
+    def login(self) -> None:
+        if self.utils.isLoggedIn():
+            logging.info("[LOGIN] Already logged-in")
+        else:
+            logging.info("[LOGIN] Logging-in...")
+            self.executeLogin()
+            logging.info("[LOGIN] Logged-in successfully !")
+
+        assert self.utils.isLoggedIn()
+
+    def executeLogin(self) -> None:
+        # Email field
+        emailField = self.utils.waitUntilVisible(By.ID, "i0116")
+        logging.info("[LOGIN] Entering email...")
+        emailField.click()
+        emailField.send_keys(self.browser.username)
+        assert emailField.get_attribute("value") == self.browser.username
+        self.utils.waitUntilClickable(By.ID, "idSIButton9").click()
+
+        # Passwordless check
+        isPasswordless = False
+        with contextlib.suppress(TimeoutException):
+            self.utils.waitUntilVisible(By.ID, "displaySign")
+            isPasswordless = True
+        logging.debug("isPasswordless = %s", isPasswordless)
+
+        if isPasswordless:
+            # Passworless login, have user confirm code on phone
+            codeField = self.utils.waitUntilVisible(By.ID, "displaySign")
+            logging.warning(
+                "[LOGIN] Confirm your login with code %s on your phone (you have"
+                " one minute)!\a",
+                codeField.text,
+            )
+            self.utils.waitUntilVisible(By.NAME, "kmsiForm", 60)
+            logging.info("[LOGIN] Successfully verified!")
+
+        else:
+            # Password-based login, enter password from accounts.json
+            passwordField = self.utils.waitUntilClickable(By.NAME, "passwd")
+            logging.info("[LOGIN] Entering password...")
+            passwordField.click()
+            passwordField.send_keys(self.browser.password)
+            assert passwordField.get_attribute("value") == self.browser.password
+            self.utils.waitUntilClickable(By.ID, "idSIButton9").click()
+
+            # Check if 2FA is enabled, both device auth and TOTP are supported
+            isDeviceAuthEnabled = False
+            with contextlib.suppress(TimeoutException):
+                self.utils.waitUntilVisible(By.ID, "idSpan_SAOTCAS_DescSessionID")
+                isDeviceAuthEnabled = True
+            logging.debug("isDeviceAuthEnabled = %s", isDeviceAuthEnabled)
+
+            isTOTPEnabled = False
+            with contextlib.suppress(TimeoutException):
+                self.utils.waitUntilVisible(By.ID, "idTxtBx_SAOTCC_OTC", 1)
+                isTOTPEnabled = True
+            logging.debug("isTOTPEnabled = %s", isTOTPEnabled)
+
+            if isDeviceAuthEnabled:
+                # For some reason, undetected chromedriver doesn't receive the confirmation
+                # after the user has confirmed the login on their phone.
+                raise Exception(
+                    "Unfortunatly, device auth is not supported yet. Turn on"
+                    " passwordless login in your account settings, use TOTPs or remove"
+                    " 2FA altogether."
                 )
-                alreadyLoggedIn = True
-                break
-            except Exception:  # pylint: disable=broad-except
-                try:
-                    self.utils.waitUntilVisible(By.ID, "i0116", 10)
-                    break
-                except Exception:  # pylint: disable=broad-except
-                    if self.utils.tryDismissAllMessages():
-                        continue
 
-        if not alreadyLoggedIn:
-            if isLocked := self.executeLogin():
-                return "Locked"
-        self.utils.tryDismissCookieBanner()
+                # Device auth, have user confirm code on phone
+                codeField = self.utils.waitUntilVisible(
+                    By.ID, "idSpan_SAOTCAS_DescSessionID"
+                )
+                logging.warning(
+                    "[LOGIN] Confirm your login with code %s on your phone (you have"
+                    " one minute)!\a",
+                    codeField.text,
+                )
+                self.utils.waitUntilVisible(By.NAME, "kmsiForm", 60)
+                logging.info("[LOGIN] Successfully verified!")
 
-        logging.info("[LOGIN] " + "Logged-in !")
+            elif isTOTPEnabled:
+                # One-time password required
+                if self.browser.totp is not None:
+                    # TOTP token provided
+                    logging.info("[LOGIN] Entering OTP...")
+                    otp = TOTP(self.browser.totp.replace(" ", "")).now()
+                    otpField = self.utils.waitUntilClickable(By.ID, "idTxtBx_SAOTCC_OTC")
+                    otpField.send_keys(otp)
+                    assert otpField.get_attribute("value") == otp
+                    self.utils.waitUntilClickable(By.ID, "idSubmit_SAOTCC_Continue").click()
 
-        self.utils.goHome()
-        points = self.utils.getAccountPoints()
+                else:
+                    # TOTP token not provided, manual intervention required
+                    assert self.args.visible, (
+                        "[LOGIN] 2FA detected, provide token in accounts.json or run in"
+                        " visible mode to handle login."
+                    )
+                    print(
+                        "[LOGIN] 2FA detected, handle prompts and press enter when on"
+                        " keep me signed in page."
+                    )
+                    input()
 
-        logging.info("[LOGIN] " + "Ensuring you are logged into Bing...")
-        self.checkBingLogin()
-        logging.info("[LOGIN] Logged-in successfully !")
-        return points
+        self.utils.waitUntilVisible(By.NAME, "kmsiForm")
+        self.utils.waitUntilClickable(By.ID, "acceptButton").click()
 
-    def executeLogin(self):
-        self.utils.waitUntilVisible(By.ID, "i0116", 10)
-        logging.info("[LOGIN] " + "Entering email...")
-        self.utils.waitUntilClickable(By.NAME, "loginfmt", 10)
-        email_field = self.webdriver.find_element(By.NAME, "loginfmt")
+        # TODO: This should probably instead be checked with an element's id,
+        # as the hardcoded text might be different in other languages
+        isAskingToProtect = self.utils.checkIfTextPresentAfterDelay(
+            "protect your account", 5
+        )
+        logging.debug("isAskingToProtect = %s", isAskingToProtect)
 
-        while True:
-            email_field.send_keys(self.browser.username)
-            time.sleep(3)
-            if email_field.get_attribute("value") == self.browser.username:
-                self.webdriver.find_element(By.ID, "idSIButton9").click()
-                break
-
-            email_field.clear()
-            time.sleep(3)
-
-        try:
-            self.enterPassword(self.browser.password)
-        except Exception:  # pylint: disable=broad-except
-            logging.error("[LOGIN] " + "2FA Code required !")
-            with contextlib.suppress(Exception):
-                code = self.webdriver.find_element(
-                    By.ID, "idRemoteNGC_DisplaySign"
-                ).get_attribute("innerHTML")
-                logging.error(f"[LOGIN] 2FA code: {code}")
-            logging.info("[LOGIN] Press enter when confirmed on your device...")
+        if isAskingToProtect:
+            assert (
+                self.args.visible
+            ), "Account protection detected, run in visible mode to handle login"
+            print(
+                "Account protection detected, handle prompts and press enter when on rewards page"
+            )
             input()
 
-        while not (
-            urllib.parse.urlparse(self.webdriver.current_url).path == "/"
-            and urllib.parse.urlparse(self.webdriver.current_url).hostname
-            == "account.microsoft.com"
-        ):
-            if urllib.parse.urlparse(self.webdriver.current_url).hostname == "rewards.bing.com":
-                self.webdriver.get("https://account.microsoft.com")
-            
-            if "Abuse" in str(self.webdriver.current_url):
-                logging.error(f"[LOGIN] {self.browser.username} is locked")
-                return True
-            self.utils.tryDismissAllMessages()
-            time.sleep(1)
-
         self.utils.waitUntilVisible(
-            By.CSS_SELECTOR, 'html[data-role-name="MeePortal"]', 10
+            By.CSS_SELECTOR, 'html[data-role-name="RewardsPortal"]'
         )
-
-    def enterPassword(self, password):
-        self.utils.waitUntilClickable(By.NAME, "passwd", 10)
-        self.utils.waitUntilClickable(By.ID, "idSIButton9", 10)
-
-        logging.info("[LOGIN] " + "Writing password...")
-
-        password_field = self.webdriver.find_element(By.NAME, "passwd")
-
-        while True:
-            password_field.send_keys(password)
-            time.sleep(3)
-            if password_field.get_attribute("value") == password:
-                self.webdriver.find_element(By.ID, "idSIButton9").click()
-                break
-
-            password_field.clear()
-            time.sleep(3)
-        time.sleep(3)
-
-    def checkBingLogin(self):
-        self.webdriver.get(
-            "https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2F"
-        )
-        while True:
-            currentUrl = urllib.parse.urlparse(self.webdriver.current_url)
-            if currentUrl.hostname == "www.bing.com" and currentUrl.path == "/":
-                time.sleep(3)
-                self.utils.tryDismissBingCookieBanner()
-                with contextlib.suppress(Exception):
-                    if self.utils.checkBingLogin():
-                        return
-            time.sleep(1)
